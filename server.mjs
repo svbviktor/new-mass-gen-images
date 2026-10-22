@@ -10,6 +10,7 @@ import { findChrome, oracleCLI, generateWithGeminiBrowser, openLogin, assertBack
 import { listChromeProfiles } from './chrome-profiles.mjs';
 import { DEFAULT_GEMINI_URL, accountProfileKey, validateGeminiAccount, geminiAccountIndex } from './gemini-accounts.mjs';
 import { ensureSessionToken, migrateLegacyData, runtimeDataDirectory } from './runtime.mjs';
+import { redactEmails } from './privacy.mjs';
 
 export const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const busy = () => Object.assign(new Error('Спочатку поставте чергу на паузу й дочекайтеся завершення зображення.'), { status: 409 });
@@ -74,7 +75,7 @@ export async function createStudio({ root = ROOT, dataDir, generate = generateWi
   const accountProfile = account => state.browserMode === 'dedicated' ? accountBrowserProfile(profile, account.id) : profile;
   const accountURL = account => state.browserMode === 'dedicated' ? DEFAULT_GEMINI_URL : account.url;
   const log = message => {
-    state.events.push({ at: new Date().toISOString(), message });
+    state.events.push({ at: new Date().toISOString(), message: redactEmails(message) });
     state.events = state.events.slice(-200);
   };
   function releaseQuotaPause() {
