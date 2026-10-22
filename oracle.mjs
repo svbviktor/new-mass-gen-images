@@ -84,12 +84,12 @@ export function loginChromeArguments(profile, geminiUrl) {
   return [`--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check', '--new-window', normalizeGeminiURL(geminiUrl)];
 }
 
-export async function openLogin(profile, { browserMode = 'dedicated', chromeProfile, geminiUrl = DEFAULT_GEMINI_URL } = {}) {
+export async function openLogin(profile, { root, browserMode = 'dedicated', chromeProfile, geminiUrl = DEFAULT_GEMINI_URL } = {}) {
   geminiUrl = normalizeGeminiURL(geminiUrl);
   const chrome = findChrome();
   if (!chrome) throw new Error('Встановіть Google Chrome або задайте CHROME_PATH.');
   if (browserMode === 'existing') return openExistingChrome(chrome, chromeProfile, geminiUrl);
-  const root = path.basename(path.dirname(profile)) === 'account-profiles' ? path.resolve(profile, '../../..') : path.resolve(profile, '../..');
+  root ||= path.basename(path.dirname(profile)) === 'account-profiles' ? path.resolve(profile, '../../..') : path.resolve(profile, '../..');
   // Manual sign-in runs in normal Chrome, with no debugging connection or automation.
   await closeBackgroundChrome(profile, root);
   const oldWindow = await runningChrome(profile);
@@ -134,7 +134,7 @@ export async function checkGeminiSession({ root, profile }) {
   }
 }
 
-export async function generateWithGeminiBrowser({ root, profile, browserMode = 'dedicated', chromeProfile = '', background = true, geminiUrl = DEFAULT_GEMINI_URL, prompt, logPath, signal, onProgress = () => {} }) {
+export async function generateWithGeminiBrowser({ root, profile, browserMode = 'dedicated', chromeProfile = '', background = true, diagnostics = false, geminiUrl = DEFAULT_GEMINI_URL, prompt, logPath, signal, onProgress = () => {} }) {
   geminiUrl = normalizeGeminiURL(geminiUrl);
   if (!existsSync(oracleCLI(root))) throw new Error('Oracle не встановлено. Запустіть «Відкрити.cmd».');
   if (!findChrome()) throw new Error('Встановіть Google Chrome.');
@@ -170,7 +170,7 @@ export async function generateWithGeminiBrowser({ root, profile, browserMode = '
   } catch (error) {
     if (error.kind === 'timeout') deadline.abort(error);
     if (['capability', 'tool-setup', 'timeout'].includes(error.kind)) closeTarget = true;
-    if (session && error.kind !== 'interrupted') {
+    if (diagnostics && session && error.kind !== 'interrupted') {
       try {
         const snapshot = await bounded(session.client.Runtime.evaluate({ expression: `(${pageState.toString()})()`, returnByValue: true }), 3000, 'Стан сторінки недоступний.');
         const state = snapshot.result?.value;

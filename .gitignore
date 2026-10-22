@@ -1,6 +1,7 @@
 node_modules/
 .npm-cache/
 .data/
+api-token
 output/
 *.log
 .test-*/

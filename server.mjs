@@ -3,12 +3,13 @@ import { existsSync } from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DEFAULT_STYLE, parseCSV, jobsFromCSV, buildPrompt, imageType, outputStem, selectedNumbers } from './core.mjs';
 import { findChrome, oracleCLI, generateWithGeminiBrowser, openLogin, assertBackgroundChrome, closeBackgroundChrome, checkExistingChrome, accountBrowserProfile, checkGeminiSession } from './oracle.mjs';
 import { listChromeProfiles } from './chrome-profiles.mjs';
 import { DEFAULT_GEMINI_URL, accountProfileKey, validateGeminiAccount, geminiAccountIndex } from './gemini-accounts.mjs';
+import { ensureSessionToken, migrateLegacyData, runtimeDataDirectory } from './runtime.mjs';
 
 export const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const busy = () => Object.assign(new Error('Спочатку поставте чергу на паузу й дочекайтеся завершення зображення.'), { status: 409 });
@@ -22,8 +23,33 @@ async function atomicJSON(file, data) {
   await fs.rename(`${file}.tmp`, file);
 }
 
-export async function createStudio({ root = ROOT, generate = generateWithGeminiBrowser, login = openLogin, listProfiles = listChromeProfiles, checkBrowser = checkExistingChrome, checkSession = checkGeminiSession } = {}) {
-  const data = path.join(root, '.data'); const defaultImages = path.join(root, 'output/images');
+async function clearDiagnosticFiles(directory) {
+  let entries;
+  try { entries = await fs.readdir(directory, { withFileTypes: true }); }
+  catch (error) { if (error.code === 'ENOENT') return 0; throw error; }
+  let removed = 0;
+  for (const entry of entries) {
+    const file = path.join(directory, entry.name);
+    if (entry.isDirectory()) removed += await clearDiagnosticFiles(file);
+    else if (entry.name === 'page.png' || entry.name === 'page-state.json') { await fs.unlink(file); removed++; }
+  }
+  return removed;
+}
+
+function progressReport(state) {
+  return {
+    version: state.version, source: state.source, style: state.style, range: state.range,
+    batchSize: state.batchSize, status: state.status, exportedAt: new Date().toISOString(),
+    jobs: state.jobs.map(job => {
+      const { geminiAccount, geminiProfile, log, phase, ...safe } = job;
+      return { ...safe, prompt: buildPrompt(job, state.style) };
+    })
+  };
+}
+
+export async function createStudio({ root = ROOT, dataDir, generate = generateWithGeminiBrowser, login = openLogin, listProfiles = listChromeProfiles, checkBrowser = checkExistingChrome, checkSession = checkGeminiSession } = {}) {
+  const data = dataDir || (path.resolve(root) === path.resolve(ROOT) ? runtimeDataDirectory() : path.join(root, '.data'));
+  const defaultImages = path.join(root, 'output/images');
   const profile = path.join(data, 'browser-profile'); const stateFile = path.join(data, 'state.json');
   await fs.mkdir(data, { recursive: true });
   const lockFile = path.join(data, 'server.lock');
@@ -84,9 +110,9 @@ export async function createStudio({ root = ROOT, generate = generateWithGeminiB
     scenes = JSON.parse(await fs.readFile(path.join(root, 'scenes.json'), 'utf8').catch(error => { if (error.code === 'ENOENT') return '{}'; throw error; }));
     try { state = JSON.parse(await fs.readFile(stateFile, 'utf8')); }
     catch (error) {
-      if (error.code !== 'ENOENT') throw new Error('Не вдалося прочитати .data/state.json. Файл збережено без змін.', { cause: error });
+      if (error.code !== 'ENOENT') throw new Error('Не вдалося прочитати локальний state.json. Файл збережено без змін.', { cause: error });
       const text = await fs.readFile(path.join(root, 'input.csv'), 'utf8');
-      state = { version: 1, source: 'input.csv', style: DEFAULT_STYLE, range: '', batchSize: 25, status: 'idle', jobs: jobsFromCSV(parseCSV(text), 0, 1, scenes), events: [] };
+      state = { version: 1, source: 'input.csv', style: DEFAULT_STYLE, range: '', batchSize: 25, diagnostics: false, status: 'idle', jobs: jobsFromCSV(parseCSV(text), 0, 1, scenes), events: [] };
       log(`Завантажено ${state.jobs.length} понять із CSV.`);
     }
     if (state.version !== 1 || !Array.isArray(state.jobs) || typeof state.style !== 'string' || !Array.isArray(state.events)) throw new Error('Невідомий формат стану; файл не змінено.');
@@ -99,6 +125,8 @@ export async function createStudio({ root = ROOT, generate = generateWithGeminiB
     state.outputDir = outputDirectory(state.outputDir ?? defaultImages);
     await fs.mkdir(state.outputDir, { recursive: true });
     state.requestDelaySeconds ??= 30;
+    state.diagnostics ??= false;
+    if (!state.diagnostics) await clearDiagnosticFiles(data);
     delete state.waitingUntil;
     state.background ??= true;
     state.browserMode ??= 'dedicated'; state.chromeProfile ??= '';
@@ -161,7 +189,7 @@ export async function createStudio({ root = ROOT, generate = generateWithGeminiB
         await fs.mkdir(runDir, { recursive: true });
         await fs.writeFile(path.join(runDir, 'prompt.txt'), step.prompt);
         try {
-          const bytes = await generate({ root, profile: accountProfile(step.account), browserMode: state.browserMode, chromeProfile: state.chromeProfile, background: state.background, geminiUrl: accountURL(step.account), prompt: step.prompt, dest: path.join(runDir, 'image.png'), logPath: path.join(runDir, 'oracle.log'), signal: controller.signal,
+          const bytes = await generate({ root, profile: accountProfile(step.account), browserMode: state.browserMode, chromeProfile: state.chromeProfile, background: state.background, diagnostics: state.diagnostics, geminiUrl: accountURL(step.account), prompt: step.prompt, dest: path.join(runDir, 'image.png'), logPath: path.join(runDir, 'oracle.log'), signal: controller.signal,
             onProgress: phase => locked(async () => { if (step.job.status === 'running') { step.job.phase = phase; await save(); } }) });
           const extension = imageType(bytes); const filename = outputStem(step.job) + extension;
           // Exclusive creation keeps files safe even if a user adds one during a request.
@@ -237,6 +265,11 @@ export async function createStudio({ root = ROOT, generate = generateWithGeminiB
         }
         requireIdle();
         let savedReady;
+        if (action === 'clear-diagnostics') {
+          const clearedDiagnostics = await clearDiagnosticFiles(data);
+          log(`Очищено діагностичних файлів: ${clearedDiagnostics}.`); await save();
+          return { ...snapshot(), clearedDiagnostics };
+        }
         if (action.startsWith('account-')) {
           const list = accounts();
           if (!list) throw invalid('Спочатку оберіть профіль Chrome.');
@@ -245,7 +278,7 @@ export async function createStudio({ root = ROOT, generate = generateWithGeminiB
             const account = list.find(item => item.id === body.id);
             if (!account) throw invalid('Акаунт не знайдено.');
             if (action === 'account-login') {
-              await login(accountProfile(account), { browserMode: 'dedicated', geminiUrl: DEFAULT_GEMINI_URL });
+              await login(accountProfile(account), { root, browserMode: 'dedicated', geminiUrl: DEFAULT_GEMINI_URL });
               delete account.sessionCheckedAt;
             } else {
               try { await checkSession({ root, profile: accountProfile(account) }); }
@@ -277,7 +310,7 @@ export async function createStudio({ root = ROOT, generate = generateWithGeminiB
           } else throw invalid('Невідома дія з акаунтом.');
           releaseQuotaPause(); await save(); return snapshot();
         }
-        if (action === 'login') { const account = accounts()?.find(account => account.enabled) || accounts()?.[0]; await login(account ? accountProfile(account) : profile, { browserMode: state.browserMode, chromeProfile: state.chromeProfile, geminiUrl: account ? accountURL(account) : DEFAULT_GEMINI_URL }); return snapshot(); }
+        if (action === 'login') { const account = accounts()?.find(account => account.enabled) || accounts()?.[0]; await login(account ? accountProfile(account) : profile, { root, browserMode: state.browserMode, chromeProfile: state.chromeProfile, geminiUrl: account ? accountURL(account) : DEFAULT_GEMINI_URL }); return snapshot(); }
         if (action === 'check-browser') {
           if (state.browserMode !== 'existing') throw invalid('Спочатку оберіть «Мій звичайний Chrome» та профіль.');
           await checkBrowser({ root, chromeProfile: state.chromeProfile }); return snapshot();
@@ -288,11 +321,13 @@ export async function createStudio({ root = ROOT, generate = generateWithGeminiB
           const batchSize = body.batchSize ?? state.batchSize;
           const requestDelaySeconds = body.requestDelaySeconds === undefined ? state.requestDelaySeconds : body.requestDelaySeconds;
           const background = body.background ?? state.background;
+          const diagnostics = body.diagnostics ?? state.diagnostics;
           const browserMode = body.browserMode ?? state.browserMode; const chromeProfile = body.chromeProfile ?? state.chromeProfile;
           if (!['dedicated', 'existing'].includes(browserMode)) throw invalid('Некоректний режим Chrome.');
           if (typeof chromeProfile !== 'string' || (browserMode === 'existing' && !chromeProfiles.some(profile => profile.id === chromeProfile))) throw invalid('Оберіть наявний профіль Chrome зі списку.');
           if (browserMode === 'existing' && background) throw invalid('Наявний профіль працює у звичайному Chrome. Вимкніть прихований режим.');
           if (typeof background !== 'boolean') throw invalid('Некоректний фоновий режим.');
+          if (typeof diagnostics !== 'boolean') throw invalid('Некоректний режим діагностики.');
           if (!Number.isInteger(batchSize) || batchSize < 0 || batchSize > 5000) throw invalid('Розмір пакета: від 1 до 5000 або 0 для всіх незавершених.');
           if (!Number.isInteger(requestDelaySeconds) || requestDelaySeconds < 0 || requestDelaySeconds > 3600) throw invalid('Затримка між запитами: ціле число від 0 до 3600 секунд.');
           selectedNumbers(body.range, state.jobs.length);
@@ -331,6 +366,8 @@ export async function createStudio({ root = ROOT, generate = generateWithGeminiB
           await scan();
           if (savedReady) log(`Збереження готових: записано ${savedReady.copied}, уже є ${savedReady.skipped}, не вдалося ${savedReady.failed.length}.`);
           state.style = body.style; state.range = body.range; state.batchSize = batchSize; state.background = background;
+          state.diagnostics = diagnostics;
+          if (!diagnostics) await clearDiagnosticFiles(data);
           state.requestDelaySeconds = requestDelaySeconds;
           state.browserMode = browserMode; state.chromeProfile = chromeProfile;
           releaseQuotaPause();
@@ -345,7 +382,7 @@ export async function createStudio({ root = ROOT, generate = generateWithGeminiB
           const jobs = jobsFromCSV(parseCSV(body.csv), body.nameColumn, body.descriptionColumn, scenes);
           await atomicJSON(path.join(data, `backup-${Date.now()}.json`), state);
           state.jobs = jobs; state.source = String(body.filename || 'CSV').slice(0, 200); state.range = ''; state.status = 'idle'; delete state.reason; delete state.batch;
-          log(`Імпортовано ${jobs.length} понять. Попередній стан збережено в .data/backup-*.json.`); await scan();
+          log(`Імпортовано ${jobs.length} понять. Попередній стан збережено в локальному резервному файлі.`); await scan();
         } else if (action === 'start') {
           if (['limit', 'login'].includes(state.reason)) throw invalid('Gemini зупинив пакет через ліміт або вхід. Після відновлення доступу натисніть «Повторити цей рядок».');
           const enabledAccounts = accounts()?.filter(account => account.enabled);
@@ -405,20 +442,35 @@ async function readBody(req) {
   catch { throw invalid('Некоректний JSON.'); }
 }
 
-export async function listen(studio, { port = 0, root = ROOT } = {}) {
+export async function listen(studio, { port = 0, root = ROOT, token = randomBytes(32).toString('base64url') } = {}) {
+  const cookieName = 'new_mass_gen_session';
+  const authorized = req => {
+    const value = String(req.headers.cookie || '').split(';').map(item => item.trim()).find(item => item.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1) || '';
+    const actual = Buffer.from(value); const expected = Buffer.from(token);
+    return actual.length === expected.length && timingSafeEqual(actual, expected);
+  };
   const server = http.createServer(async (req, res) => {
     try {
       const port = server.address().port;
       const origins = [`http://127.0.0.1:${port}`, `http://localhost:${port}`];
       if (!origins.includes(`http://${req.headers.host}`) || (req.headers.origin && !origins.includes(req.headers.origin)) || ['cross-site', 'same-site'].includes(req.headers['sec-fetch-site'])) return send(res, 403, { message: 'Доступ лише з цієї локальної студії.' });
       const url = new URL(req.url, origins[0]);
+      const bootstrap = url.pathname.match(/^\/session\/([A-Za-z0-9_-]{43})$/);
+      if (req.method === 'GET' && bootstrap) {
+        const actual = Buffer.from(bootstrap[1]); const expected = Buffer.from(token);
+        if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return send(res, 401, { message: 'Недійсний локальний доступ.' });
+        res.writeHead(302, { Location: '/', 'Set-Cookie': `${cookieName}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+        return res.end();
+      }
+      const protectedPath = url.pathname.startsWith('/api/') || url.pathname.startsWith('/images/') || url.pathname.startsWith('/logs/');
+      if (protectedPath && !authorized(req)) return send(res, 401, { message: 'Запустіть студію через «Відкрити.cmd».' });
       if (req.method === 'GET') {
         if (staticFiles[url.pathname]) { const [file, type] = staticFiles[url.pathname]; return send(res, 200, await fs.readFile(path.join(root, file)), type); }
         if (url.pathname === '/api/health') return send(res, 200, { app: 'new-mass-gen', root });
         if (url.pathname === '/api/state') return send(res, 200, await studio.snapshot());
         if (url.pathname === '/api/report') {
           const state = await studio.snapshot();
-          return send(res, 200, { ...state, jobs: state.jobs.map(job => ({ ...job, prompt: buildPrompt(job, state.style) })) }, 'application/json', { 'Content-Disposition': 'attachment; filename="generation-report.json"' });
+          return send(res, 200, progressReport(state), 'application/json', { 'Content-Disposition': 'attachment; filename="generation-report.json"' });
         }
         const media = url.pathname.match(/^\/images\/(\d+)$/);
         if (media) { const image = await studio.image(Number(media[1])); if (!image) return send(res, 404, 'Не знайдено.', 'text/plain'); return send(res, 200, image.bytes, imageType(image.bytes) === '.jpg' ? 'image/jpeg' : imageType(image.bytes) === '.png' ? 'image/png' : 'image/webp'); }
@@ -440,14 +492,18 @@ export async function listen(studio, { port = 0, root = ROOT } = {}) {
       if (!res.headersSent) send(res, error.status || 400, { message: error.message });
     }
   });
+  Object.defineProperty(server, 'sessionToken', { value: token });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
   return server;
 }
 
 async function main() {
-  const studio = await createStudio();
+  const dataDir = runtimeDataDirectory();
+  await migrateLegacyData(ROOT, dataDir);
+  const token = await ensureSessionToken(dataDir);
+  const studio = await createStudio({ dataDir });
   let server;
-  try { server = await listen(studio, { port: Number(process.env.PORT || 4188) }); }
+  try { server = await listen(studio, { port: Number(process.env.PORT || 4188), token }); }
   catch (error) { await studio.close(); throw error; }
   console.log(`New Mass Gen: http://127.0.0.1:${server.address().port}/`);
   const close = async () => { server.close(); await studio.close(); process.exit(0); };

@@ -137,14 +137,14 @@ function render() {
   $('status-dot').classList.toggle('running', active());
   $('tools-status').textContent = `${state.oracle ? 'Сесії Chrome: Oracle 0.21.6' : '✕ Oracle відсутній'} · ${state.chrome ? '✓ Chrome' : '✕ Chrome відсутній'}`;
   $('output-dir').textContent = state.outputDir;
-  if (!dirty) { $('style').value = state.style; $('range').value = state.range; $('batch-size').value = state.batchSize ?? 25; $('request-delay').value = state.requestDelaySeconds ?? 30; $('background').checked = state.background !== false; $('output-folder').value = state.outputDir; }
+  if (!dirty) { $('style').value = state.style; $('range').value = state.range; $('batch-size').value = state.batchSize ?? 25; $('request-delay').value = state.requestDelaySeconds ?? 30; $('background').checked = state.background !== false; $('diagnostics').checked = state.diagnostics === true; $('output-folder').value = state.outputDir; }
   if (!dirty) {
     $('browser-mode').value = state.browserMode || 'dedicated';
     const options = [node('option', '', 'Оберіть профіль…')]; options[0].value = '';
     for (const profile of state.chromeProfiles || []) { const option = node('option', '', `${profile.name}${profile.account ? ' · ' + profile.account : ''}`); option.value = profile.id; options.push(option); }
     $('chrome-profile').replaceChildren(...options); $('chrome-profile').value = state.chromeProfile || '';
   }
-  for (const id of ['style', 'range', 'batch-size', 'request-delay', 'background', 'output-folder', 'save-output-folder', 'save-settings', 'scan', 'login', 'import-button']) $(id).disabled = active() || savingReady;
+  for (const id of ['style', 'range', 'batch-size', 'request-delay', 'background', 'diagnostics', 'clear-diagnostics', 'output-folder', 'save-output-folder', 'save-settings', 'scan', 'login', 'import-button']) $(id).disabled = active() || savingReady;
   $('save-ready').disabled = active() || savingReady || !state.jobs.some(job => ['done', 'exists'].includes(job.status));
   renderBrowserMode();
   $('start').textContent = `▶ Генерувати пакет · ${state.nextBatch ?? state.queued}`;
@@ -156,12 +156,13 @@ function render() {
   const events = state.events.slice(-4).reverse().map(event => { const li = node('li'); const time = node('time', '', new Date(event.at).toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' })); li.append(time, document.createTextNode(event.message)); return li; });
   $('events').replaceChildren(...events);
 }
-async function saveSettings(command = 'settings') { state = await request(command, { style: $('style').value, range: $('range').value, batchSize: Number($('batch-size').value), requestDelaySeconds: $('request-delay').value === '' ? null : Number($('request-delay').value), background: $('background').checked, browserMode: $('browser-mode').value, chromeProfile: $('chrome-profile').value, outputDir: $('output-folder').value }); dirty = false; render(); }
+async function saveSettings(command = 'settings') { state = await request(command, { style: $('style').value, range: $('range').value, batchSize: Number($('batch-size').value), requestDelaySeconds: $('request-delay').value === '' ? null : Number($('request-delay').value), background: $('background').checked, diagnostics: $('diagnostics').checked, browserMode: $('browser-mode').value, chromeProfile: $('chrome-profile').value, outputDir: $('output-folder').value }); dirty = false; render(); }
 $('style').addEventListener('input', () => { dirty = true; renderDetail(); }); $('range').addEventListener('input', () => dirty = true);
 $('batch-size').addEventListener('change', () => dirty = true);
 $('request-delay').addEventListener('input', () => dirty = true);
 $('output-folder').addEventListener('input', () => dirty = true);
 $('background').addEventListener('change', () => dirty = true);
+$('diagnostics').addEventListener('change', () => dirty = true);
 $('browser-mode').addEventListener('change', () => { dirty = true; $('background').checked = $('browser-mode').value === 'dedicated'; renderBrowserMode(); });
 $('chrome-profile').addEventListener('change', () => { dirty = true; renderAccounts(); });
 listen('add-account', async () => { await accountAction('account-add', { name: $('account-name').value, url: $('browser-mode').value === 'dedicated' ? DEFAULT_GEMINI_URL : $('account-url').value, enabled: true }); $('account-name').value = ''; $('account-url').value = ''; notify(state.browserMode === 'dedicated' ? 'Акаунт додано. Натисніть «Увійти» в його картці, щоб зберегти вхід.' : 'Акаунт додано.'); });
@@ -183,6 +184,7 @@ listen('stop', () => action('stop'));
 listen('login', async () => { if (dirty) await saveSettings(); await action('login'); notify(state.browserMode === 'existing' ? 'Відкрито ваш Chrome. Кнопкою 2 скопіюйте адресу доступу та відкрийте її в адресному рядку Chrome.' : state.background ? 'Увійдіть у Gemini, потім закрийте це вікно. Пакет працюватиме без видимих вікон.' : 'Увійдіть у Gemini та запустіть пакет.'); });
 listen('copy-debug-url', () => navigator.clipboard.writeText('chrome://inspect/#remote-debugging').then(() => notify('Адресу скопійовано. У звичайному Chrome натисніть Ctrl+L, Ctrl+V, Enter.')));
 listen('check-browser', async () => { if (dirty) await saveSettings(); notify('Якщо Chrome попросить дозвіл, натисніть Allow у його вікні.'); await action('check-browser'); notify('Підключення до вибраного профілю Chrome перевірено. Запити на зображення не надсилалися.'); });
+listen('clear-diagnostics', async () => { await action('clear-diagnostics'); notify(`Очищено діагностичних файлів: ${state.clearedDiagnostics || 0}.`); });
 listen('copy-path', () => navigator.clipboard.writeText(state.outputDir).then(() => notify('Шлях скопійовано.')));
 $('search').addEventListener('input', renderJobs);
 for (const button of document.querySelectorAll('[data-filter]')) button.addEventListener('click', () => { filter = button.dataset.filter; document.querySelectorAll('[data-filter]').forEach(item => item.classList.toggle('active', item === button)); renderJobs(); });
@@ -206,8 +208,8 @@ $('import-form').addEventListener('submit', async event => {
 let refreshing = false;
 async function refresh() {
   if (refreshing) return; refreshing = true;
-  try { const response = await fetch('/api/state'); if (!response.ok) throw new Error(); state = await response.json(); render(); }
-  catch { $('run-label').textContent = 'Сервер не відповідає'; $('run-detail').textContent = 'Відкрийте «Відкрити.cmd», щоб продовжити зі збереженого місця.'; $('start').disabled = true; }
+  try { const response = await fetch('/api/state'); if (!response.ok) throw Object.assign(new Error(), { status: response.status }); state = await response.json(); render(); }
+  catch (error) { $('run-label').textContent = error.status === 401 ? 'Потрібен захищений локальний запуск' : 'Сервер не відповідає'; $('run-detail').textContent = 'Відкрийте «Відкрити.cmd», щоб продовжити зі збереженого місця.'; $('start').disabled = true; }
   finally { refreshing = false; }
 }
 await refresh(); setInterval(refresh, 2500);

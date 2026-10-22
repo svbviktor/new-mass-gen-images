@@ -79,6 +79,13 @@
       </div>
       <label class="background-option"><input id="background" type="checkbox" checked> Виконувати у фоні без вікон</label>
       <small class="hint" id="browser-hint">Після входу закрийте окреме вікно Gemini. Пакет виконається автоматично; запити на екрані не з’являтимуться.</small>
+      <details class="security-settings">
+        <summary>Безпека та діагностика</summary>
+        <label class="background-option"><input id="diagnostics" type="checkbox"> Зберігати знімок сторінки при помилці</label>
+        <small class="hint">За замовчуванням вимкнено: знімок може містити дані акаунта або текст Gemini. Увімкніть лише для пошуку конкретної помилки.</small>
+        <button id="clear-diagnostics" class="secondary full" type="button">Очистити діагностичні знімки</button>
+        <small class="hint">Сесії Google і прогрес зберігаються окремо в захищеній папці вашого профілю Windows.</small>
+      </details>
       <small id="tools-status" class="hint">Перевірка Oracle та Chrome…</small>
     </section>
     <div class="side-footer"><span class="green-dot"></span> Локально на вашому комп’ютері<small>Послідовна генерація · прогрес зберігається</small></div>

@@ -402,7 +402,7 @@ test('an existing Chrome profile is validated, saved, checked and passed to the 
     assert.equal((await f.studio.snapshot()).browserMode, 'dedicated');
     await f.studio.action('settings', { style: DEFAULT_STYLE, range: '', browserMode: 'existing', chromeProfile: 'Profile 1', background: false });
     await f.studio.action('login'); await f.studio.action('check-browser');
-    assert.deepEqual(logins, [{ browserMode: 'existing', chromeProfile: 'Profile 1', geminiUrl: 'https://gemini.google.com/app' }]);
+    assert.deepEqual(logins, [{ root: f.root, browserMode: 'existing', chromeProfile: 'Profile 1', geminiUrl: 'https://gemini.google.com/app' }]);
     assert.equal(checks[0].chromeProfile, 'Profile 1');
     assert.equal(calls.length, 0);
     await f.studio.action('start'); await f.studio.settled();
@@ -518,7 +518,7 @@ test('account login and hidden session checks use only that account profile and 
     const account = (await f.studio.snapshot()).geminiAccounts.dedicated[1];
     await f.studio.action('account-login', { id: account.id });
     assert.equal(logins[0].profile, path.join(f.root, '.data/account-profiles', account.id));
-    assert.deepEqual(logins[0].options, { browserMode: 'dedicated', geminiUrl: 'https://gemini.google.com/app' });
+    assert.deepEqual(logins[0].options, { root: f.root, browserMode: 'dedicated', geminiUrl: 'https://gemini.google.com/app' });
     await f.studio.action('account-check', { id: account.id });
     assert.equal(checks[0].profile, logins[0].profile);
     assert.ok((await f.studio.snapshot()).geminiAccounts.dedicated[1].sessionCheckedAt);
@@ -668,25 +668,48 @@ test('a second app cannot share the same progress directory', async () => {
   const f = await fixture(); try { await assert.rejects(createStudio({ root: f.root }), /Спочатку/); } finally { await f.clean(); }
 });
 
+test('diagnostic screenshots are opt-in and can be removed without deleting logs', async () => {
+  const f = await fixture();
+  try {
+    const run = path.join(f.root, '.data', 'runs', 'test'); await fs.mkdir(run, { recursive: true });
+    await fs.writeFile(path.join(run, 'page.png'), PNG); await fs.writeFile(path.join(run, 'page-state.json'), '{}'); await fs.writeFile(path.join(run, 'oracle.log'), 'keep');
+    const cleared = await f.studio.action('clear-diagnostics');
+    assert.equal(cleared.clearedDiagnostics, 2); await assert.rejects(fs.access(path.join(run, 'page.png'))); await assert.rejects(fs.access(path.join(run, 'page-state.json')));
+    assert.equal(await fs.readFile(path.join(run, 'oracle.log'), 'utf8'), 'keep');
+    await f.studio.action('settings', { style: DEFAULT_STYLE, range: '', diagnostics: true });
+    assert.equal((await f.studio.snapshot()).diagnostics, true);
+  } finally { await f.clean(); }
+});
+
 test('local HTTP imports, generates, downloads and rejects foreign-site mutations', async () => {
   const f = await fixture(); const server = await listen(f.studio); const url = `http://127.0.0.1:${server.address().port}`;
-  const post = (action, body, extra = {}) => fetch(`${url}/api/${action}`, { method: 'POST', headers: { 'content-type': 'application/json', ...extra }, body: JSON.stringify(body) });
+  let cookie = '';
+  const get = (resource, options = {}) => fetch(`${url}${resource}`, { ...options, headers: { cookie, ...options.headers } });
+  const post = (action, body, extra = {}) => get(`/api/${action}`, { method: 'POST', headers: { 'content-type': 'application/json', ...extra }, body: JSON.stringify(body) });
   try {
     assert.equal((await fetch(url)).status, 200);
     const chromeSession = await fetch(`${url}/chrome-session`);
     assert.equal(chromeSession.status, 200); assert.match(await chromeSession.text(), /Підключаємо студію/);
+    assert.equal((await fetch(`${url}/api/state`)).status, 401);
+    assert.equal((await fetch(`${url}/images/2`)).status, 401);
+    assert.equal((await fetch(`${url}/session/${'x'.repeat(43)}`, { redirect: 'manual' })).status, 401);
+    const bootstrap = await fetch(`${url}/session/${server.sessionToken}`, { redirect: 'manual' });
+    assert.equal(bootstrap.status, 302); assert.equal(bootstrap.headers.get('location'), '/');
+    assert.match(bootstrap.headers.get('set-cookie'), /HttpOnly; SameSite=Strict/);
+    cookie = bootstrap.headers.get('set-cookie').split(';')[0];
     assert.equal((await post('start', {}, { origin: 'https://example.org', 'sec-fetch-site': 'cross-site' })).status, 403);
     assert.equal((await post('start', {}, { 'sec-fetch-site': 'same-site' })).status, 403);
     assert.equal((await post('preview', { csv: CSV })).status, 200);
     assert.equal((await post('import', { csv: CSV, nameColumn: -1, descriptionColumn: 1 })).status, 400);
     assert.equal((await post('settings', { style: DEFAULT_STYLE, range: '2' })).status, 200);
     assert.equal((await post('start', {})).status, 200); await f.studio.settled();
-    const image = await fetch(`${url}/images/2`); assert.equal(image.headers.get('content-type'), 'image/png');
+    const image = await get('/images/2'); assert.equal(image.headers.get('content-type'), 'image/png');
     assert.deepEqual(Buffer.from(await image.arrayBuffer()), PNG);
-    const report = await (await fetch(`${url}/api/report`)).json(); assert.equal(report.jobs[1].status, 'done'); assert.ok(report.jobs[1].prompt.includes('Батарея'));
+    const report = await (await get('/api/report')).json(); assert.equal(report.jobs[1].status, 'done'); assert.ok(report.jobs[1].prompt.includes('Батарея'));
+    assert.equal(report.root, undefined); assert.equal(report.outputDir, undefined); assert.equal(report.geminiAccounts, undefined); assert.equal(report.jobs[1].geminiAccount, undefined);
     const saved = await (await post('save-ready', { style: DEFAULT_STYLE, range: '', outputDir: path.join(f.root, 'saved-ready') })).json();
     assert.deepEqual(saved.savedReady, { copied: 1, skipped: 0, failed: [] });
-    assert.deepEqual(Buffer.from(await (await fetch(`${url}/images/2`)).arrayBuffer()), PNG);
+    assert.deepEqual(Buffer.from(await (await get('/images/2')).arrayBuffer()), PNG);
     assert.equal((await fetch(`${url}/.data/state.json`)).status, 404);
     assert.equal((await fetch(`${url}/images/../../input.csv`)).status, 404);
   } finally { await new Promise(resolve => server.close(resolve)); await f.clean(); }
