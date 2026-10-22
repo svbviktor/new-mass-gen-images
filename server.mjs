@@ -9,7 +9,7 @@ import { DEFAULT_STYLE, parseCSV, jobsFromCSV, buildPrompt, imageType, outputSte
 import { findChrome, oracleCLI, generateWithGeminiBrowser, openLogin, assertBackgroundChrome, closeBackgroundChrome, checkExistingChrome, accountBrowserProfile, checkGeminiSession } from './oracle.mjs';
 import { listChromeProfiles } from './chrome-profiles.mjs';
 import { DEFAULT_GEMINI_URL, accountProfileKey, validateGeminiAccount, geminiAccountIndex } from './gemini-accounts.mjs';
-import { ensureSessionToken, migrateLegacyData, runtimeDataDirectory } from './runtime.mjs';
+import { ensureSessionToken, migrateLegacyData, runtimeDataDirectory, ensureInstallationId } from './runtime.mjs';
 import { redactEmails } from './privacy.mjs';
 
 export const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -53,6 +53,7 @@ export async function createStudio({ root = ROOT, dataDir, generate = generateWi
   const defaultImages = path.join(root, 'output/images');
   const profile = path.join(data, 'browser-profile'); const stateFile = path.join(data, 'state.json');
   await fs.mkdir(data, { recursive: true });
+  const instanceId = await ensureInstallationId(data);
   const lockFile = path.join(data, 'server.lock');
   try { await fs.writeFile(lockFile, String(process.pid), { flag: 'wx' }); }
   catch (error) {
@@ -145,7 +146,7 @@ export async function createStudio({ root = ROOT, dataDir, generate = generateWi
   function snapshot() {
     const included = selected();
     const queued = state.jobs.filter(job => included.has(job.number) && job.status === 'pending').length;
-    return { ...structuredClone(state), root, chromeProfiles,
+    return { ...structuredClone(state), instanceId, chromeProfiles,
       queued, nextBatch: Math.min(queued, state.batchSize || queued),
       batchDone: state.jobs.filter(job => state.batch?.numbers.includes(job.number) && ['done', 'exists'].includes(job.status)).length,
       batchFailed: state.jobs.filter(job => state.batch?.numbers.includes(job.number) && ['error', 'interrupted'].includes(job.status)).length,
@@ -254,6 +255,7 @@ export async function createStudio({ root = ROOT, dataDir, generate = generateWi
   }
 
   return {
+    instanceId,
     snapshot: () => locked(snapshot),
     async action(action, body = {}) {
       return locked(async () => {
@@ -467,7 +469,7 @@ export async function listen(studio, { port = 0, root = ROOT, token = randomByte
       if (protectedPath && !authorized(req)) return send(res, 401, { message: 'Запустіть студію через «Відкрити.cmd».' });
       if (req.method === 'GET') {
         if (staticFiles[url.pathname]) { const [file, type] = staticFiles[url.pathname]; return send(res, 200, await fs.readFile(path.join(root, file)), type); }
-        if (url.pathname === '/api/health') return send(res, 200, { app: 'new-mass-gen', root });
+        if (url.pathname === '/api/health') return send(res, 200, { app: 'new-mass-gen', instanceId: studio.instanceId });
         if (url.pathname === '/api/state') return send(res, 200, await studio.snapshot());
         if (url.pathname === '/api/report') {
           const state = await studio.snapshot();
