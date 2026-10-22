@@ -57,7 +57,7 @@ export async function createStudio({ root = ROOT, dataDir, generate = generateWi
   catch (error) {
     if (error.code !== 'EEXIST') throw error;
     const pid = Number(await fs.readFile(lockFile, 'utf8'));
-    if (!Number.isInteger(pid) || pid <= 0) throw new Error('Перевірте .data/server.lock: некоректний номер процесу.');
+    if (!Number.isInteger(pid) || pid <= 0) throw new Error('Перевірте локальний server.lock: некоректний номер процесу.');
     try { process.kill(pid, 0); throw busy(); }
     catch (check) { if (check.code !== 'ESRCH') throw check; }
     await fs.unlink(lockFile);
